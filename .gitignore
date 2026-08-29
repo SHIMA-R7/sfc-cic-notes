@@ -1,0 +1,17 @@
+# カートリッジのROMデータは、プライベートリポジトリでも第三者のサーバーへ上げない。
+# 公開リポジトリ側の方針「ROMダンプ・カートリッジの著作物データは一切コミットしない」に揃える。
+results/*.bin
+*.sfc
+*.smc
+*.srm
+
+# Python
+__pycache__/
+*.pyc
+
+# 第三者のソース。入手先は reference/SOURCES.md に記録する
+reference/*
+!reference/SOURCES.md
+
+# 実験ログ（成果物ではない）
+*.log
