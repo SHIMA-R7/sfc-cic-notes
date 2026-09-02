@@ -8,19 +8,42 @@
 //   // Set clocks to 4Mhz/1Mhz for better SA-1 unlocking
 // この「遅いクロックなら暴れないのか」を実機で確かめるための道具。
 //
-// ■ 配線
-//   D10 (OC1B) -> カート1番。GNDは治具と共通にすること。
+// ■ 配線（2026-09-02 変更）
+//   D10 (OC1B) -> **カート57番（PHI2 / CPUクロック）**
+//   D8         -> clockduino の VCC（カート1番へ 21.477MHz を出す board の電源）
+//   GNDは治具と共通にすること。
+//
+//   **clockduino の D9 は 57番から外すこと。** 給電中は常に出ているので
+//   ソフトで止められず、D10と同時に繋ぐと出力どうしがぶつかる。
+//   1番は clockduino、57番は Uno、と担当を分ける。
 //   このUnoはPCのUSBから給電される（治具の電源電圧を変えても影響を受けない）。
 //
 // ■ 出せる周波数  16MHz / (2 * (OCR1A+1))
 //   OCR1A=0 : 8.000 MHz      =4 : 1.600 MHz
 //   OCR1A=1 : 4.000 MHz  ★  =5 : 1.333 MHz
 //   OCR1A=2 : 2.667 MHz      =6 : 1.143 MHz
-//   OCR1A=3 : 2.000 MHz      =7 : 1.000 MHz  ★ sanniのCPUクロック相当
+//   OCR1A=3 : 2.000 MHz      =7 : 1.000 MHz
+//
+// **sanniのPHI2は 3.579545 MHz だが、16MHzの整数分周では作れない。**
+//   16/3.579545 = 4.47 で割り切れない。挟めるのは 4.000MHz(+11.7%) と
+//   2.667MHz(-25.5%)。**4.000MHz が最も近い。**
+//   高速PWM(f = 16/(TOP+1))を使えば 3.200MHz(-10.6%) も出せるので、
+//   コマンド 'p' で切り替えられるようにした。デューティは60%になる。
 //
 // ■ コマンド（115200bps）
 //   x    クロックを止める。**D10はLOWで固定**（浮かせない）
 //   z    D10を入力(ハイインピーダンス)にする。**配線の影響を切り分けるため**
+//   v    clockduino(21.477MHz)へ給電する。D8=HIGH
+//   w    clockduino への給電を止める。D8=LOW
+//
+// ■ D8 で clockduino の VCC を直接駆動している
+// AVRのGPIOは1本あたり定格20mA・絶対最大40mA。21.477MHzで動くATmega328は
+// 12〜20mA食うので**定格の境目**である。裸のDIPなら通るが、LEDやレギュレータの
+// 載った基板だと超える。発熱するようなら 2N7000 でGND側を切る方式へ変えること。
+//
+// ■ 排他制御は不要になった
+// D10がカート57番に移ったので、1番(clockduino)と57番(D10)は別の線になった。
+// 両方を同時に出せる。sanniの構成がまさにそれである。
 //   0-9  OCR1A をその値にしてクロックを出す
 //   ?    現在の状態を返す
 //
@@ -39,13 +62,32 @@
 // 従来は配線していなかったので結果的にハイインピーダンスで、区別が付いていなかった。
 
 const uint8_t CLK_PIN = 10;      // OC1B
-int8_t current = -1;             // -1 = 停止
+const uint8_t CD_PWR  = 8;       // clockduino(21.477MHz)のVCC
+int8_t current = -1;             // -1 = 停止 / -2 = ハイインピーダンス
+bool cdOn = false;               // clockduinoに給電しているか
+
+void cdPower(bool on) {
+  pinMode(CD_PWR, OUTPUT);
+  digitalWrite(CD_PWR, on ? HIGH : LOW);
+  cdOn = on;
+}
 
 void stopClock() {
   TCCR1A = 0; TCCR1B = 0;        // タイマー切り離し
   pinMode(CLK_PIN, OUTPUT);
   digitalWrite(CLK_PIN, LOW);    // 浮かせずLOWに落とす
   current = -1;
+}
+
+// 高速PWM。f = 16MHz/(TOP+1)。CTCでは作れない周波数を埋めるため。
+// デューティは (OCR1B+1)/(TOP+1) なので厳密な50%にはならない。
+void startFastPwm(uint8_t top) {
+  pinMode(CLK_PIN, OUTPUT);
+  TCCR1A = _BV(COM1B1) | _BV(WGM11) | _BV(WGM10);
+  TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS10);   // 高速PWM, TOP=OCR1A
+  OCR1A = top;
+  OCR1B = top / 2;
+  current = 100 + top;
 }
 
 void startClock(uint8_t ocr) {
@@ -58,6 +100,7 @@ void startClock(uint8_t ocr) {
 }
 
 void hiZ() {
+  // ここでは clockduino の状態に触らない（給電したままD10だけ手を離す用途がある）
   // D10を入力にして、カート1番から手を離す。
   // 「Unoを繋いだことが原因か」を確かめるときに使う。
   TCCR1A = 0; TCCR1B = 0;
@@ -66,18 +109,26 @@ void hiZ() {
 }
 
 void report() {
-  if (current == -2) { Serial.println(F("clk=hi-Z")); return; }
+  Serial.print(F("cart1="));
+  Serial.print(cdOn ? F("21.477MHz") : F("なし"));
+  Serial.print(F(" / cart57="));
+  if (current == -2) { Serial.println(F("hi-Z")); return; }
+  if (current == -1) { Serial.println(F("LOW固定")); return; }
+  if (current >= 100) {                       // 高速PWM
+    Serial.print(16000.0 / (current - 100 + 1) / 1000.0, 3);
+    Serial.println(F(" MHz (高速PWM)")); return;
+  }
   if (current < 0) { Serial.println(F("clk=off")); return; }
   // 16000 kHz / (2*(n+1))
-  uint32_t hz10 = 160000000UL / (2UL * (current + 1));   // 0.1Hz単位を避け kHz*10 で
-  Serial.print(F("clk=on OCR1A=")); Serial.print(current);
-  Serial.print(F(" ")); Serial.print(hz10 / 10000.0, 3); Serial.println(F(" MHz"));
+  Serial.print(16000.0 / (2.0 * (current + 1)) / 1000.0, 3);
+  Serial.println(F(" MHz"));
 }
 
 void setup() {
   Serial.begin(115200);
+  cdPower(false);                // **既定は clockduino に給電しない**
   hiZ();                         // **既定はハイインピーダンス**（LOW固定は駄目）
-  Serial.println(F("uno_clockgen ready (z=hi-Z[既定], x=LOW固定, 0-9=on, ?=status)"));
+  Serial.println(F("ready: cart57= z:hi-Z x:LOW 0-9:CTC p:3.2MHz / cart1= v:on w:off / ?:status"));
 }
 
 void loop() {
@@ -86,5 +137,8 @@ void loop() {
   if (c == 'x' || c == 'X') { stopClock(); report(); }
   else if (c >= '0' && c <= '9') { startClock(c - '0'); report(); }
   else if (c == 'z' || c == 'Z') { hiZ(); report(); }
+  else if (c == 'v' || c == 'V') { cdPower(true);  report(); }
+  else if (c == 'p' || c == 'P') { startFastPwm(4); report(); }   // 3.200MHz
+  else if (c == 'w' || c == 'W') { cdPower(false); report(); }
   else if (c == '?') report();
 }
