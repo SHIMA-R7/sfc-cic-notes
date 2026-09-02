@@ -56,6 +56,21 @@ U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ A0, /*data=*/ A1,
 #define BYTE_BIT _BV(PC2)          // A2 = Nano-2 D4から分岐した1バイトごとのパルス
 volatile uint16_t byteCount = 0;
 
+// ── CIC認証のやり直し ────────────────────────────────────────────
+// **電源投入時に1回だけ認証する作りだった。** やり直すには電源を切るしかなく、
+// 実験のたびに電源サイクルが要る原因になっていた。
+//
+// バンクリセット線(D10/PB2)のパルス幅で指示を分ける。
+//   短い → 従来どおりバンクを0に戻す
+//   長い → それに加えて認証をやり直す
+// Nano-1で /WR を足したときと同じ手。配線を増やさずに合図を送れる。
+//
+// **ISRの中では認証しない。** 認証は数十ms掛かるうえ ticks() でクロックを刻むので、
+// ISR内で回すとバンクストローブを取りこぼす。フラグだけ立てて loop() で実行する。
+const uint16_t REAUTH_COUNT_MIN = 400;   // これ以上ならやり直し指示
+const uint16_t REAUTH_COUNT_MAX = 1600;  // 上限。異常に長いとき抜けるため
+volatile bool reauthRequest = false;
+
 #define BANK_RESET_BIT  _BV(PB2)
 #define BANK_STROBE_BIT _BV(PB3)
 
@@ -78,9 +93,16 @@ ISR(PCINT0_vect) {
   const uint8_t rose = (uint8_t)(now & ~last);
   last = now;
   if (rose & BANK_RESET_BIT) {
+    // **従来の動作を先に済ませる。ここを遅らせてはいけない。**
+    // Nano-1で同じことをやって読み出しを壊した（0/6）。
     bankNo = 0;
     byteCount = 0;          // 1バンクの読み出し開始。バイト位置も0から
     writeBank(0);
+    // そのあと、まだHIGHのままかを数える。長ければ「CIC認証をやり直せ」の合図。
+    // Nano-2側は resetNano3Bank() を長く出すだけでよく、**配線を増やさずに済む。**
+    uint16_t n = 0;
+    while ((PINB & BANK_RESET_BIT) && n < REAUTH_COUNT_MAX) n++;
+    if (n >= REAUTH_COUNT_MIN) reauthRequest = true;   // ISR内では走らせない
   } else if (rose & BANK_STROBE_BIT) {
     writeBank(++bankNo);
   }
@@ -210,7 +232,7 @@ static bool authenticate() {
   return ok == ROUND0_BITS;
 }
 
-static bool authOk;
+static bool authOk;   // loop() の再認証からも書くのでファイル全体で持つ
 
 
 void setup() {
@@ -251,6 +273,33 @@ void setup() {
 }
 
 void loop() {
+  // ── CIC認証のやり直し（ISRが立てたフラグを見て実行する）──────────
+  // **ISRの中では絶対に走らせない。** 認証は数十ms掛かり ticks() でクロックを刻むので、
+  // ISR内で回すとバンクストローブを取りこぼす。
+  if (reauthRequest) {
+    noInterrupts(); reauthRequest = false; interrupts();
+
+    // **認証中はすべての割り込みを止める。**
+    // authenticate() は ticks() でクロックのパルス数を数えて時間を測る。
+    // 割り込みが1回でも入ると波形が伸びて握手が壊れる。
+    //
+    // setup() から呼ぶときは sei() より前なので元から割り込みが無い。
+    // **loop() から呼ぶときは全部有効なので、ここで明示的に止める必要がある。**
+    // PCIE0(バンク) だけ落としても、PCIE1(A2のバイトストローブ) と
+    // Timer0(millis) が残る。それでは足りない。
+    noInterrupts();
+    authOk = authenticate();     // 入口で線を確保し、出口で解放する自己完結型
+    interrupts();
+
+    // バンク側の状態を作り直す。認証中にPORTB/PORTCを触っているため。
+    bankNo = 0; byteCount = 0;
+    writeBank(0);
+
+    oled.drawString(0, 2, authOk ? "CIC round0 OK " : "CIC FAILED    ");
+    oled.drawString(0, 4, authOk ? "re-auth done  " : "re-auth FAILED");
+    return;                      // 描画は次の周回に回す
+  }
+
   // 割り込みで進む値を、人が読める速さで描くだけ。
   // I2Cは数ms掛かるので、毎回描くと割り込みを塞ぐ時間が増える。
   //
