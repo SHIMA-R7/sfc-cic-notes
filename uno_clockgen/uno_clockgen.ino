@@ -9,6 +9,7 @@
 // この「遅いクロックなら暴れないのか」を実機で確かめるための道具。
 //
 // ■ 配線（2026-09-02 変更）
+//   A5  (PC5)  -> **カート54番（/WR）を観測する**。入力。駆動しない
 //   D10 (OC1B) -> **カート57番（PHI2 / CPUクロック）**
 //   D8         -> clockduino の VCC（カート1番へ 21.477MHz を出す board の電源）
 //   GNDは治具と共通にすること。
@@ -33,6 +34,8 @@
 // ■ コマンド（115200bps）
 //   x    クロックを止める。**D10はLOWで固定**（浮かせない）
 //   z    D10を入力(ハイインピーダンス)にする。**配線の影響を切り分けるため**
+//   s    /WR(A5)の監視を開始する。カウンタを0にして立ち下がりを数え始める
+//   e    監視を終了し「立ち下がり回数 現在のレベル」を返す
 //   v    clockduino(21.477MHz)へ給電する。D8=HIGH
 //   w    clockduino への給電を止める。D8=LOW
 //
@@ -63,6 +66,17 @@
 
 const uint8_t CLK_PIN = 10;      // OC1B
 const uint8_t CD_PWR  = 8;       // clockduino(21.477MHz)のVCC
+const uint8_t WR_WATCH = A5;     // カート54番(/WR)の観測。**入力のまま。絶対に駆動しない**
+volatile uint16_t wrFalls = 0;   // /WR の立ち下がり回数
+volatile bool     watching = false;
+
+// PCINT1 は PORTC の変化でまとめて呼ばれる。A5(PC5)の立ち下がりだけ数える。
+ISR(PCINT1_vect) {
+  static uint8_t last = _BV(PC5);
+  const uint8_t now = PINC & _BV(PC5);
+  if (watching && last && !now) wrFalls++;   // HIGH -> LOW
+  last = now;
+}
 int8_t current = -1;             // -1 = 停止 / -2 = ハイインピーダンス
 bool cdOn = false;               // clockduinoに給電しているか
 
@@ -108,6 +122,22 @@ void hiZ() {
   current = -2;
 }
 
+void startWatch() {
+  pinMode(WR_WATCH, INPUT);      // **駆動しない。** プルアップも掛けない
+  wrFalls = 0;
+  watching = true;
+  PCICR  |= _BV(PCIE1);
+  PCMSK1 |= _BV(PCINT13);        // A5 だけ
+}
+
+void endWatch() {
+  watching = false;
+  Serial.print(F("wr_falls="));
+  Serial.print(wrFalls);
+  Serial.print(F(" level="));
+  Serial.println((PINC & _BV(PC5)) ? F("HIGH") : F("LOW"));
+}
+
 void report() {
   Serial.print(F("cart1="));
   Serial.print(cdOn ? F("21.477MHz") : F("なし"));
@@ -126,6 +156,7 @@ void report() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(WR_WATCH, INPUT);      // /WR は観測のみ。**出力にしない**
   cdPower(false);                // **既定は clockduino に給電しない**
   hiZ();                         // **既定はハイインピーダンス**（LOW固定は駄目）
   Serial.println(F("ready: cart57= z:hi-Z x:LOW 0-9:CTC p:3.2MHz / cart1= v:on w:off / ?:status"));
@@ -140,5 +171,7 @@ void loop() {
   else if (c == 'v' || c == 'V') { cdPower(true);  report(); }
   else if (c == 'p' || c == 'P') { startFastPwm(4); report(); }   // 3.200MHz
   else if (c == 'w' || c == 'W') { cdPower(false); report(); }
+  else if (c == 's' || c == 'S') { startWatch(); Serial.println(F("watch=on")); }
+  else if (c == 'e' || c == 'E') { endWatch(); }
   else if (c == '?') report();
 }
