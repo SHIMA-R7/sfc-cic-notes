@@ -1062,6 +1062,7 @@ SA-1制御レジスタへS-CPUが書き込む初期化シーケンスが要る**
 - Nano-2(COM16, CH340)は**新ブートローダ系統**。`--fqbn arduino:avr:nano:cpu=atmega328`
   で書き込む。`atmega328old` では "programmer is not responding" になる
 - Nano-3(COM8, FTDI)は `atmega328old` で書き込める
+- **Nano-1(CH340)も `atmega328old`**（2026-09-02 実測。USB未接続なので普段はポートが出ない）
 
 ### /RESETは効く。クロックだけが効かない（2026-08-26、切り分け）
 
